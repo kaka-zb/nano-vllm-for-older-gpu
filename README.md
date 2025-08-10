@@ -1,6 +1,9 @@
-# Nano-vLLM
+# Nano-vLLM-for-Older-GPU
 
 A lightweight vLLM implementation built from scratch.
+
+>The original implementation is incompatible with older GPU architectures such as V100 or T4.
+>This repository provides compatibility by leveraging the torch_native attention backend.
 
 ## Key Features
 

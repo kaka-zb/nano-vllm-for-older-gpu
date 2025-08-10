@@ -8,7 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import set_context, get_context, reset_context, set_sdpa_context
 from nanovllm.utils.loader import load_model
 
 
@@ -31,7 +31,7 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.warmup_model()
+        # self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -106,7 +106,8 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        # config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        config.num_kvcache_blocks = 5368709120 // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
@@ -131,18 +132,34 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        seq_lens = []
+        prefill_seq_lens = []
+        seq_slot_mapping = []
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
+
+            seq_lens.append(seqlen_k)
+            prefill_seq_lens.append(seqlen_q)
+
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:
                 continue
+
+            for i in range(seq.num_blocks):
+                start = seq.block_table[i] * self.block_size
+                if i != seq.num_blocks - 1:
+                    end = start + self.block_size
+                else:
+                    end = start + seq.last_block_num_tokens 
+                seq_slot_mapping.extend(list(range(start, end)))
+
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
@@ -158,6 +175,12 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        prefill_seq_lens = torch.tensor(prefill_seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        seq_slot_mapping = torch.tensor(seq_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_sdpa_context(seq_lens, prefill_seq_lens, seq_slot_mapping)
+
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -165,7 +188,19 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        seq_lens = []
+        seq_slot_mapping = []
         for seq in seqs:
+            seq_lens.append(len(seq))
+
+            for i in range(seq.num_blocks):
+                start = seq.block_table[i] * self.block_size
+                if i != seq.num_blocks - 1:
+                    end = start + self.block_size
+                else:
+                    end = start + seq.last_block_num_tokens 
+                seq_slot_mapping.extend(list(range(start, end)))
+
             input_ids.append(seq.last_token)
             positions.append(len(seq))
             context_lens.append(len(seq))
@@ -176,6 +211,11 @@ class ModelRunner:
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        seq_slot_mapping = torch.tensor(seq_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_sdpa_context(seq_lens, None, seq_slot_mapping)
+
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
